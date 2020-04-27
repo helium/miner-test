@@ -5,9 +5,6 @@
 -include_lib("blockchain/include/blockchain_vars.hrl").
 -include("miner_test_macros.hrl").
 
--define(BASE_TMP_DIR, "./_build/test/tmp").
--define(BASE_TMP_DIR_TEMPLATE, "XXXXXXXXXX").
-
 -export([
          init_per_testcase/3,
          end_per_testcase/2,
@@ -20,7 +17,6 @@
          connect/1,
          count/2,
          randname/1,
-         get_config/2,
          get_balance/2,
          get_block/2,
          make_vars/1, make_vars/2, make_vars/3,
@@ -57,8 +53,17 @@
          wait_for_gte/3, wait_for_gte/5,
 
          submit_txn/2,
-         wait_for_txn/2, wait_for_txn/3
+         wait_for_txn/2, wait_for_txn/3, wait_for_txn/4,
+         get_txn_block_details/2, get_txn_block_details/3,
+         get_txn/2,
+         get_genesis_block/2,
+         load_genesis_block/3,
 
+         get_ledger_state_channel/3,
+         check_ledger_state_channel/3,
+         check_sc_num_dcs/3,
+         check_sc_num_packets/3,
+         set_miner_default_routers/2
         ]).
 
 
@@ -71,7 +76,7 @@ stop_miners(Miners, Retries) ->
          ct_rpc:call(Miner, application, stop, [blockchain], 300)
      end
      || Miner <- Miners],
-    ok = miner_ct_utils:wait_for_app_stop(Miners, miner, Retries),
+    ok = miner_test:wait_for_app_stop(Miners, miner, Retries),
     ok.
 
 start_miners(Miners) ->
@@ -83,7 +88,7 @@ start_miners(Miners, Retries) ->
          ct_rpc:call(Miner, application, start, [miner], 300)
      end
      || Miner <- Miners],
-    ok = miner_ct_utils:wait_for_registration(Miners, blockchain_worker, Retries),
+    ok = miner_test:wait_for_registration(Miners, blockchain_worker, Retries),
     ok.
 
 height(Miner) ->
@@ -140,20 +145,20 @@ election_check([], _Miners, _AddrList, Owner) ->
     Owner ! seen_all;
 election_check(NotSeen0, Miners, AddrList, Owner) ->
     timer:sleep(500),
-    Members = miner_ct_utils:consensus_members(Miners),
-    MinerNames = lists:map(fun(Member)-> miner_ct_utils:addr2node(Member, AddrList) end, Members),
+    Members = miner_test:consensus_members(Miners),
+    MinerNames = lists:map(fun(Member)-> miner_test:addr2node(Member, AddrList) end, Members),
     NotSeen = NotSeen0 -- MinerNames,
     Owner ! {not_seen, NotSeen},
     election_check(NotSeen, Miners, AddrList, Owner).
 
-integrate_genesis_block(ConsensusMiner, NonConsensusMiners)->
+integrate_genesis_block(ConsensusMiner, Nodes)->
     Blockchain = ct_rpc:call(ConsensusMiner, blockchain_worker, blockchain, []),
     {ok, GenesisBlock} = ct_rpc:call(ConsensusMiner, blockchain, genesis_block, [Blockchain]),
 
-    %% TODO - do we need to assert here on results from genesis load ?
-    miner_ct_utils:pmap(fun(M) ->
-                                ct_rpc:call(M, blockchain_worker, integrate_genesis_block, [GenesisBlock])
-                        end, NonConsensusMiners).
+    Res = miner_test:pmap(fun(Node) ->
+                                  ct_rpc:call(Node, blockchain_worker, integrate_genesis_block, [GenesisBlock])
+                          end, Nodes),
+    lists:all(fun(R) -> R == ok end, Res).
 
 blockchain_worker_check(Miners)->
     lists:all(
@@ -170,7 +175,7 @@ confirm_balance(Miners, Addr, Bal) ->
     ?assertAsync(begin
                      Result = lists:all(
                                 fun(Miner) ->
-                                        Bal == miner_ct_utils:get_balance(Miner, Addr)
+                                        Bal == miner_test:get_balance(Miner, Addr)
                                 end, Miners)
                  end,
                  Result == true, 60, timer:seconds(5)),
@@ -180,8 +185,8 @@ confirm_balance_both_sides(Miners, PayerAddr, PayeeAddr, PayerBal, PayeeBal) ->
     ?assertAsync(begin
                      Result = lists:all(
                                 fun(Miner) ->
-                                        PayerBal == miner_ct_utils:get_balance(Miner, PayerAddr) andalso
-                                            PayeeBal == miner_ct_utils:get_balance(Miner, PayeeAddr)
+                                        PayerBal == miner_test:get_balance(Miner, PayerAddr) andalso
+                                            PayeeBal == miner_test:get_balance(Miner, PayeeAddr)
                                 end, Miners)
                  end,
                  Result == true, 60, timer:seconds(1)),
@@ -207,16 +212,18 @@ wait_for_gte(Type, Miners, Threshold, Mod, Retries)->
                                       fun(Miner) ->
                                               try
                                                   handle_gte_type(Type, Miner, Threshold)
-                                              catch _:_ ->
+                                              catch What:Why ->
+                                                      ct:pal("Failed to check GTE ~p ~p ~p: ~p:~p", [Type, Miner, Threshold, What, Why]),
                                                       false
                                               end
-                                      end, miner_ct_utils:shuffle(Miners))
+                                      end, miner_test:shuffle(Miners))
                        end,
                        Result == true, Retries, timer:seconds(1)),
 
-    case Res of
-        true -> ok;
-        false -> {error, false}
+    try Res of
+        true -> ok
+    catch _:_ ->
+            {error, false}
     end.
 
 wait_for_registration(Miners, Mod) ->
@@ -306,7 +313,7 @@ wait_for_chain_var_update(Miners, Key, Value, Timeout)->
                                         R = ct_rpc:call(Miner, blockchain, config, [Key, Ledger], Timeout),
                                         ct:pal("var = ~p", [R]),
                                         {ok, Value} == R
-                                end, miner_ct_utils:shuffle(Miners))
+                                end, miner_test:shuffle(Miners))
                  end,
                  Result, 40, timer:seconds(1)),
     ok.
@@ -323,7 +330,7 @@ delete_dirs(DirWildcard, SubDir)->
 inital_dkg(Miners, Txns, Addresses, NumConsensusMembers, Curve)->
     inital_dkg(Miners, Txns, Addresses, NumConsensusMembers, Curve, 12000).
 inital_dkg(Miners, Txns, Addresses, NumConsensusMembers, Curve, Timeout)->
-    DKGResults = miner_ct_utils:pmap(
+    DKGResults = miner_test:pmap(
                    fun(Miner) ->
                            ct_rpc:call(Miner, miner_consensus_mgr, initial_dkg,
                                        [Txns, Addresses, NumConsensusMembers, Curve], Timeout)
@@ -465,13 +472,6 @@ randname(0, Acc) ->
 randname(N, Acc) ->
     randname(N - 1, [rand:uniform(26) + 96 | Acc]).
 
-get_config(Arg, Default) ->
-    case os:getenv(Arg, Default) of
-        false -> Default;
-        T when is_list(T) -> list_to_integer(T);
-        T -> T
-    end.
-
 shuffle(List) ->
     R = [{rand:uniform(1000000), I} || I <- List],
     O = lists:sort(R),
@@ -489,7 +489,7 @@ addr2node(Addr, AddrList) ->
     Node.
 
 addr_list(Miners) ->
-    miner_ct_utils:pmap(
+    miner_test:pmap(
       fun(M) ->
               Addr = ct_rpc:call(M, blockchain_swarm, pubkey_bin, []),
               {M, Addr}
@@ -498,7 +498,7 @@ addr_list(Miners) ->
 partition_miners(Members, AddrList) ->
     {Miners, _} = lists:unzip(AddrList),
     lists:partition(fun(Miner) ->
-                            Addr = miner_ct_utils:node2addr(Miner, AddrList),
+                            Addr = miner_test:node2addr(Miner, AddrList),
                             lists:member(Addr, Members)
                     end, Miners).
 
@@ -507,167 +507,49 @@ init_per_testcase(Mod, TestCase, Config0) ->
     BaseDir = ?config(base_dir, Config),
     LogDir = ?config(log_dir, Config),
 
-    os:cmd(os:find_executable("epmd")++" -daemon"),
-    {ok, Hostname} = inet:gethostname(),
-    case net_kernel:start([list_to_atom("runner-miner" ++
-                                            integer_to_list(erlang:system_time(nanosecond)) ++
-                                            "@"++Hostname), shortnames]) of
-        {ok, _} -> ok;
-        {error, {already_started, _}} -> ok;
-        {error, {{already_started, _},_}} -> ok
-    end,
+    ok = start_runner(),
 
     %% Miner configuration, can be input from os env
-    TotalMiners =
-        case TestCase of
-            restart_test ->
-                4;
-            _ ->
-                get_config("T", 8)
-        end,
-    NumConsensusMembers =
-        case TestCase of
-            group_change_test ->
-                4;
-            restart_test ->
-                4;
-            _ ->
-                get_config("N", 7)
-        end,
+    TotalMiners = list_to_integer(os:getenv("T", "5")),
+    NumConsensusMembers = list_to_integer(os:getenv("N", "4")),
     SeedNodes = [],
-    Port = get_config("PORT", 0),
+    Port = list_to_integer(os:getenv("PORT", "0")),
     Curve = 'SS512',
-    BlockTime = get_config("BT", 100),
-    BatchSize = get_config("BS", 500),
-    Interval = get_config("INT", 5),
+    BlockTime = list_to_integer(os:getenv("BT", "100")),
+    BatchSize = list_to_integer(os:getenv("BS", "500")),
+    Interval = list_to_integer(os:getenv("INT", "5")),
+    MinersAndPorts = init_ports(Config, TotalMiners),
+    MinerKeys = init_keys(Config, MinersAndPorts),
 
-    MinersAndPorts = miner_ct_utils:pmap(
-                       fun(I) ->
-                               MinerName = list_to_atom(integer_to_list(I) ++ miner_ct_utils:randname(5)),
-                               {miner_ct_utils:start_node(MinerName, Config, miner_dist_SUITE), {45000, 0}}
-                       end,
-                       lists:seq(1, TotalMiners)
-                      ),
+    %% Get miner config results
+    MinerConfigResult = miner_config_result(LogDir, BaseDir, Port, SeedNodes, TotalMiners, Curve, MinerKeys),
 
-    Keys = miner_ct_utils:pmap(
-             fun({Miner, Ports}) ->
-                     miner_ct_utils:start_node(Miner, Config, miner_dist_SUITE),
-                     #{secret := GPriv, public := GPub} =
-                         libp2p_crypto:generate_keys(ecc_compact),
-                     GECDH = libp2p_crypto:mk_ecdh_fun(GPriv),
-                     GAddr = libp2p_crypto:pubkey_to_bin(GPub),
-                     GSigFun = libp2p_crypto:mk_sig_fun(GPriv),
-                     {Miner, Ports, GECDH, GPub, GAddr, GSigFun}
-             end, MinersAndPorts),
-
-
-
-    ConfigResult = miner_ct_utils:pmap(
-                     fun({Miner, {TCPPort, UDPPort}, ECDH, PubKey, _Addr, SigFun}) ->
-                             ct:pal("Miner ~p", [Miner]),
-                             ct_rpc:call(Miner, cover, start, []),
-                             ct_rpc:call(Miner, application, load, [lager]),
-                             ct_rpc:call(Miner, application, load, [miner]),
-                             ct_rpc:call(Miner, application, load, [blockchain]),
-                             ct_rpc:call(Miner, application, load, [libp2p]),
-                             %% give each miner its own log directory
-                             LogRoot = LogDir ++ "_" ++ atom_to_list(Miner),
-                             ct:pal("MinerLogRoot: ~p", [LogRoot]),
-                             ct_rpc:call(Miner, application, set_env, [lager, log_root, LogRoot]),
-                             ct_rpc:call(Miner, application, set_env, [lager, metadata_whitelist, [poc_id]]),
-                             %% set blockchain configuration
-                             Key = {PubKey, ECDH, SigFun},
-
-                             MinerBaseDir = BaseDir ++ "_" ++ atom_to_list(Miner),
-                             ct:pal("MinerBaseDir: ~p", [MinerBaseDir]),
-                             %% set blockchain env
-                             ct_rpc:call(Miner, application, set_env, [blockchain, base_dir, MinerBaseDir]),
-                             ct_rpc:call(Miner, application, set_env, [blockchain, port, Port]),
-                             ct_rpc:call(Miner, application, set_env, [blockchain, seed_nodes, SeedNodes]),
-                             ct_rpc:call(Miner, application, set_env, [blockchain, key, Key]),
-                             ct_rpc:call(Miner, application, set_env, [blockchain, peer_cache_timeout, 30000]),
-                             ct_rpc:call(Miner, application, set_env, [blockchain, peerbook_update_interval, 200]),
-                             ct_rpc:call(Miner, application, set_env, [blockchain, peerbook_allow_rfc1918, true]),
-                             ct_rpc:call(Miner, application, set_env, [blockchain, disable_poc_v4_target_challenge_age, true]),
-                             ct_rpc:call(Miner, application, set_env, [blockchain, max_inbound_connections, TotalMiners*2]),
-                             ct_rpc:call(Miner, application, set_env, [blockchain, outbound_gossip_connections, TotalMiners]),
-                             ct_rpc:call(Miner, application, set_env, [blockchain, sync_cooldown_time, 5]),
-                             %% set miner configuration
-                             ct_rpc:call(Miner, application, set_env, [miner, curve, Curve]),
-                             ct_rpc:call(Miner, application, set_env, [miner, radio_device, {{127,0,0,1}, UDPPort, {127,0,0,1}, TCPPort}]),
-                             ct_rpc:call(Miner, application, set_env, [miner, stabilization_period_start, 2]),
-
-                             {ok, _StartedApps} = ct_rpc:call(Miner, application, ensure_all_started, [miner]),
-                             ok
-                     end,
-                     Keys
-                    ),
-
-    Miners = [M || {M, _} <- MinersAndPorts],
     %% check that the config loaded correctly on each miner
-    true = lists:all(
-             fun(ok) -> true;
-                (Res) ->
-                     ct:pal("config setup failure: ~p", [Res]),
-                     false
-             end,
-             ConfigResult
-            ),
+    true = check_config_result(MinerConfigResult),
 
-    Addrs = miner_ct_utils:pmap(
-              fun(Miner) ->
-                      Swarm = ct_rpc:call(Miner, blockchain_swarm, swarm, [], 2000),
-                      [H|_] = ct_rpc:call(Miner, libp2p_swarm, listen_addrs, [Swarm], 2000),
-                      H
-              end, Miners),
+    %% Gather miner nodes
+    Miners = [M || {M, _} <- MinersAndPorts],
 
-    miner_ct_utils:pmap(
-      fun(Miner) ->
-              Swarm = ct_rpc:call(Miner, blockchain_swarm, swarm, [], 2000),
-              lists:foreach(
-                fun(A) ->
-                        ct_rpc:call(Miner, libp2p_swarm, connect, [Swarm, A], 2000)
-                end, Addrs)
-      end, Miners),
+    %% Gather miner listen addrs
+    MinerListenAddrs = acc_listen_addrs(Miners),
 
+    %% connect miners
+    true = connect_addrs(Miners, MinerListenAddrs),
 
-    %% make sure each node is gossiping with a majority of its peers
-    true = miner_ct_utils:wait_until(fun() ->
-                                             lists:all(fun(Miner) ->
-                                                               GossipPeers = ct_rpc:call(Miner, blockchain_swarm, gossip_peers, [], 2000),
-                                                               case length(GossipPeers) >= (length(Miners) / 2) + 1 of
-                                                                   true -> true;
-                                                                   false ->
-                                                                       ct:pal("~p is not connected to enough peers ~p", [Miner, GossipPeers]),
-                                                                       Swarm = ct_rpc:call(Miner, blockchain_swarm, swarm, [], 2000),
-                                                                       lists:foreach(
-                                                                         fun(A) ->
-                                                                                 CRes = ct_rpc:call(Miner, libp2p_swarm, connect, [Swarm, A], 2000),
-                                                                                 ct:pal("Connecting ~p to ~p: ~p", [Miner, A, CRes])
-                                                                         end, Addrs),
-                                                                       false
-                                                               end
-                                                       end, Miners)
-                                     end),
+    %% make sure each miner is gossiping with a majority of its peers
+    true = check_gossip(Miners, MinerListenAddrs),
 
-    %% accumulate the address of each miner
-    Addresses = lists:foldl(
-                  fun(Miner, Acc) ->
-                          Address = ct_rpc:call(Miner, blockchain_swarm, pubkey_bin, []),
-                          [Address | Acc]
-                  end,
-                  [],
-                  Miners
-                 ),
+    %% accumulate the pubkey_bins of each miner
+    MinerPubkeyBins = acc_pubkey_bins(Miners),
+
+    %% add both miners and router to cover
     {ok, _} = ct_cover:add_nodes(Miners),
 
     %% wait until we get confirmation the miners are fully up
     %% which we are determining by the miner_consensus_mgr being registered
-    %% QUESTION: is there a better process to use to determine things are healthy
-    %%           and which works for both in consensus and non consensus miners?
-    ok = miner_ct_utils:wait_for_registration(Miners, miner_consensus_mgr),
-                                                %ok = miner_ct_utils:wait_for_registration(Miners, blockchain_worker),
+    ok = miner_test:wait_for_registration(Miners, miner_consensus_mgr),
 
+    %% XXX Configure packet forwarder, this is not required?
     UpdatedMinersAndPorts = lists:map(fun({Miner, {TCPPort, _}}) ->
                                               {ok, RandomPort} = ct_rpc:call(Miner, miner_lora, port, []),
                                               ct:pal("~p is listening for packet forwarder on ~p", [Miner, RandomPort]),
@@ -676,9 +558,9 @@ init_per_testcase(Mod, TestCase, Config0) ->
 
     [
      {miners, Miners},
-     {keys, Keys},
+     {miner_keys, MinerKeys},
      {ports, UpdatedMinersAndPorts},
-     {addresses, Addresses},
+     {miner_pubkey_bins, MinerPubkeyBins},
      {block_time, BlockTime},
      {batch_size, BatchSize},
      {dkg_curve, Curve},
@@ -690,7 +572,9 @@ init_per_testcase(Mod, TestCase, Config0) ->
 
 end_per_testcase(TestCase, Config) ->
     Miners = ?config(miners, Config),
-    miner_ct_utils:pmap(fun(Miner) -> ct_slave:stop(Miner) end, Miners),
+    Routers = ?config(routers, Config),
+    miner_test:pmap(fun(Miner) -> ct_slave:stop(Miner) end, Miners),
+    miner_test:pmap(fun(Router) -> ct_slave:stop(Router) end, Routers),
     case ?config(tc_status, Config) of
         ok ->
             %% test passed, we can cleanup
@@ -877,7 +761,7 @@ create_tmp_dir(Path)->
 %% generate a tmp directory based off priv_dir to be used as a scratch by common tests
 %% @end
 %%-------------------------------------------------------------------
--spec init_base_dir_config(atom(), atom(), list()) -> {list(), list()}.
+-spec init_base_dir_config(atom(), atom(), list()) -> list().
 init_base_dir_config(Mod, TestCase, Config)->
     PrivDir = ?config(priv_dir, Config),
     BaseDir = PrivDir ++ "data/" ++ erlang:atom_to_list(Mod) ++ "_" ++ erlang:atom_to_list(TestCase),
@@ -903,33 +787,55 @@ init_base_dir_config(Mod, TestCase, Config)->
 %% @end
 %%-------------------------------------------------------------------
 wait_for_txn(Miners, PredFun) ->
-    wait_for_txn(Miners, PredFun, timer:seconds(30)).
+    wait_for_txn(Miners, PredFun, timer:seconds(30), true).
 
-wait_for_txn(Miners, PredFun, Timeout)->
+wait_for_txn(Miners, PredFun, Timeout) ->
+    wait_for_txn(Miners, PredFun, Timeout, true).
+
+wait_for_txn(Miners, PredFun, Timeout, ExpectedResult)->
     ?assertAsync(begin
                      Result = lists:all(
                                 fun(Miner) ->
-                                        C = ct_rpc:call(Miner, blockchain_worker, blockchain, [], Timeout),
-                                        {ok, H} = ct_rpc:call(Miner, blockchain, height, [C], Timeout),
-                                        Blocks = ct_rpc:call(Miner, blockchain, blocks, [C], Timeout),
-
-                                        Res = lists:filter(fun({_Hash, Block}) ->
-                                                                   BH = blockchain_block:height(Block),
-                                                                   Txns = blockchain_block:transactions(Block),
-                                                                   ToFind = lists:filter(fun(T) ->
-                                                                                                 PredFun(T)
-                                                                                         end,
-                                                                                         Txns),
-                                                                   ct:pal("BlockHeight: ~p, ToFind: ~p", [BH, ToFind]),
-                                                                   ToFind /= []
-                                                           end,
-                                                           maps:to_list(Blocks)),
-                                        ct:pal("ChainHeight: ~p, Res: ~p", [H, Res]),
+                                        Res = get_txn_block_details(Miner, PredFun, Timeout),
+                                        lager:info("Res: ~p", [Res]),
                                         Res /= []
-                                end, miner_ct_utils:shuffle(Miners))
+
+                                end, miner_test:shuffle(Miners))
                  end,
-                 Result == true, 40, timer:seconds(1)),
+                 Result == ExpectedResult, 40, timer:seconds(1)),
     ok.
+
+get_txn_block_details(Miner, PredFun) ->
+    get_txn_block_details(Miner, PredFun, timer:seconds(5)).
+
+get_txn_block_details(Miner, PredFun, Timeout) ->
+    case ct_rpc:call(Miner, blockchain_worker, blockchain, [], Timeout) of
+        {badrpc, Error} ->
+            Error;
+        Chain ->
+            case ct_rpc:call(Miner, blockchain, blocks, [Chain], Timeout) of
+                {badrpc, Error} ->
+                    Error;
+                Blocks ->
+                    lists:filter(fun({_Hash, Block}) ->
+                                         %% BH = blockchain_block:height(Block),
+                                         Txns = blockchain_block:transactions(Block),
+                                         ToFind = lists:filter(fun(T) ->
+                                                                       PredFun(T)
+                                                               end,
+                                                               Txns),
+                                         %% ct:pal("BlockHeight: ~p, ToFind: ~p", [BH, ToFind]),
+                                         ToFind /= []
+                                 end,
+                                 maps:to_list(Blocks))
+            end
+    end.
+
+get_txn([{_, B}], PredFun) ->
+    hd(lists:filter(fun(T) ->
+                            PredFun(T)
+                    end,
+                    blockchain_block:transactions(B))).
 
 %% ------------------------------------------------------------------
 %% Local Helper functions
@@ -955,8 +861,13 @@ handle_miners_by_consensus(Mod, Bool, Miners)->
 handle_gte_type(height, Miner, Threshold)->
     C0 = ct_rpc:call(Miner, blockchain_worker, blockchain, [], 2000),
     {ok, Height} = ct_rpc:call(Miner, blockchain, height, [C0], 2000),
-    ct:pal("miner ~p height ~p  Threshold ~p", [Miner, Height, Threshold]),
-    Height >= Threshold;
+    case Height >= Threshold of
+        false ->
+            ct:pal("miner ~p height ~p  Threshold ~p", [Miner, Height, Threshold]),
+            false;
+        true ->
+            true
+    end;
 handle_gte_type(epoch, Miner, Threshold)->
     {Height, _, Epoch} = ct_rpc:call(Miner, miner_cli_info, get_info, [], 2000),
     ct:pal("miner ~p Height ~p Epoch ~p Threshold ~p", [Miner, Height, Epoch, Threshold]),
@@ -966,3 +877,209 @@ handle_gte_type(height_exactly, Miner, Threshold)->
     {ok, Ht} = ct_rpc:call(Miner, blockchain, height, [C]),
     ct:pal("miner ~p height ~p Exact Threshold ~p", [Miner, Ht, Threshold]),
     Ht == Threshold.
+
+get_genesis_block(Miners, Config) ->
+    RPCTimeout = ?config(rpc_timeout, Config),
+    ct:pal("RPCTimeout: ~p", [RPCTimeout]),
+    %% obtain the genesis block
+    GenesisBlock = get_genesis_block_(Miners, RPCTimeout),
+    ?assertNotEqual(undefined, GenesisBlock),
+    GenesisBlock.
+
+get_genesis_block_([Miner|Miners], RPCTimeout) ->
+    case ct_rpc:call(Miner, blockchain_worker, blockchain, [], RPCTimeout) of
+        {badrpc, Reason} ->
+            ct:fail(Reason),
+            get_genesis_block_(Miners ++ [Miner], RPCTimeout);
+        undefined ->
+            get_genesis_block_(Miners ++ [Miner], RPCTimeout);
+        Chain ->
+            {ok, GBlock} = rpc:call(Miner, blockchain, genesis_block, [Chain], RPCTimeout),
+            GBlock
+    end.
+
+load_genesis_block(GenesisBlock, Miners, Config) ->
+    RPCTimeout = ?config(rpc_timeout, Config),
+    %% load the genesis block on all the nodes
+    lists:foreach(
+      fun(Miner) ->
+              %% wait for the consensus manager to be booted
+              true = miner_test:wait_until(
+                       fun() ->
+                               is_boolean(ct_rpc:call(Miner, miner_consensus_mgr, in_consensus, [], RPCTimeout))
+                       end),
+              case ct_rpc:call(Miner, miner_consensus_mgr, in_consensus, [], RPCTimeout) of
+                  true ->
+                      ok;
+                  false ->
+                      Res = ct_rpc:call(Miner, blockchain_worker,
+                                        integrate_genesis_block, [GenesisBlock], RPCTimeout),
+                      ct:pal("loading genesis ~p block on ~p ~p", [GenesisBlock, Miner, Res]);
+                  {badrpc, Reason} ->
+                      ct:pal("failed to load genesis block on ~p: ~p", [Miner, Reason])
+              end
+      end,
+      Miners
+     ),
+
+    ok = miner_test:wait_for_gte(height, Miners, 1, all, 30).
+
+init_ports(Config, Count) ->
+    miner_test:pmap(
+      fun(I) ->
+              NodeName = list_to_atom(integer_to_list(I) ++ miner_test:randname(5)),
+              {miner_test:start_node(NodeName, Config, router_suite), {45000, 0}}
+      end,
+      lists:seq(1, Count)).
+
+init_keys(Config, NodesAndPorts) ->
+    miner_test:pmap(
+      fun({Node, Ports}) ->
+              miner_test:start_node(Node, Config, router_suite),
+              #{secret := GPriv, public := GPub} =
+                  libp2p_crypto:generate_keys(ecc_compact),
+              GECDH = libp2p_crypto:mk_ecdh_fun(GPriv),
+              GAddr = libp2p_crypto:pubkey_to_bin(GPub),
+              GSigFun = libp2p_crypto:mk_sig_fun(GPriv),
+              {Node, Ports, GECDH, GPub, GAddr, GSigFun}
+      end, NodesAndPorts).
+
+check_config_result(ConfigResult) ->
+    lists:all(
+      fun(ok) -> true;
+         (Res) ->
+              ct:pal("config setup failure: ~p", [Res]),
+              false
+      end,
+      ConfigResult
+     ).
+
+acc_listen_addrs(Nodes) ->
+    miner_test:pmap(
+      fun(Node) ->
+              Swarm = ct_rpc:call(Node, blockchain_swarm, swarm, [], 2000),
+              [H|_] = ct_rpc:call(Node, libp2p_swarm, listen_addrs, [Swarm], 2000),
+              H
+      end, Nodes).
+
+connect_addrs(Nodes, Addrs) ->
+    Res = miner_test:pmap(
+            fun(Node) ->
+                    Swarm = ct_rpc:call(Node, blockchain_swarm, swarm, [], 2000),
+                    lists:foreach(
+                      fun(A) ->
+                              ct_rpc:call(Node, libp2p_swarm, connect, [Swarm, A], 2000)
+                      end, Addrs)
+            end, Nodes),
+    lists:all(fun(R) -> R == ok end, Res).
+
+check_gossip(Nodes, Addrs) ->
+    miner_test:wait_until(fun() ->
+                                  lists:all(fun(Node) ->
+                                                    GossipPeers = ct_rpc:call(Node, blockchain_swarm, gossip_peers, [], 2000),
+                                                    case length(GossipPeers) >= (length(Nodes) / 2) + 1 of
+                                                        true -> true;
+                                                        false ->
+                                                            ct:pal("~p is not connected to enough peers ~p", [Node, GossipPeers]),
+                                                            Swarm = ct_rpc:call(Node, blockchain_swarm, swarm, [], 2000),
+                                                            lists:foreach(
+                                                              fun(A) ->
+                                                                      CRes = ct_rpc:call(Node, libp2p_swarm, connect, [Swarm, A], 2000),
+                                                                      ct:pal("Connecting ~p to ~p: ~p", [Node, A, CRes])
+                                                              end, Addrs),
+                                                            false
+                                                    end
+                                            end, Nodes)
+                          end).
+acc_pubkey_bins(Nodes) ->
+    lists:foldl(
+      fun(Node, Acc) ->
+              Address = ct_rpc:call(Node, blockchain_swarm, pubkey_bin, []),
+              [Address | Acc]
+      end,
+      [],
+      Nodes
+     ).
+
+miner_config_result(LogDir, BaseDir, Port, SeedNodes, TotalMiners, Curve, MinerKeys) ->
+    miner_test:pmap(
+      fun({Miner, {TCPPort, UDPPort}, ECDH, PubKey, _Addr, SigFun}) ->
+              ct:pal("Miner ~p", [Miner]),
+              ct_rpc:call(Miner, cover, start, []),
+              ct_rpc:call(Miner, application, load, [lager]),
+              ct_rpc:call(Miner, application, load, [miner]),
+              ct_rpc:call(Miner, application, load, [blockchain]),
+              ct_rpc:call(Miner, application, load, [libp2p]),
+              %% give each miner its own log directory
+              LogRoot = LogDir ++ "_miner_" ++ atom_to_list(Miner),
+              ct:pal("MinerLogRoot: ~p", [LogRoot]),
+              ct_rpc:call(Miner, application, set_env, [lager, log_root, LogRoot]),
+              ct_rpc:call(Miner, application, set_env, [lager, metadata_whitelist, [poc_id]]),
+
+              %% set blockchain configuration
+              Key = {PubKey, ECDH, SigFun},
+
+              MinerBaseDir = BaseDir ++ "_miner_" ++ atom_to_list(Miner),
+              ct:pal("MinerBaseDir: ~p", [MinerBaseDir]),
+              %% set blockchain env
+              ct_rpc:call(Miner, application, set_env, [blockchain, base_dir, MinerBaseDir]),
+              ct_rpc:call(Miner, application, set_env, [blockchain, port, Port]),
+              ct_rpc:call(Miner, application, set_env, [blockchain, seed_nodes, SeedNodes]),
+              ct_rpc:call(Miner, application, set_env, [blockchain, key, Key]),
+              ct_rpc:call(Miner, application, set_env, [blockchain, peer_cache_timeout, 30000]),
+              ct_rpc:call(Miner, application, set_env, [blockchain, peerbook_update_interval, 200]),
+              ct_rpc:call(Miner, application, set_env, [blockchain, peerbook_allow_rfc1918, true]),
+              ct_rpc:call(Miner, application, set_env, [blockchain, disable_poc_v4_target_challenge_age, true]),
+              ct_rpc:call(Miner, application, set_env, [blockchain, max_inbound_connections, TotalMiners*2]),
+              ct_rpc:call(Miner, application, set_env, [blockchain, outbound_gossip_connections, TotalMiners]),
+              ct_rpc:call(Miner, application, set_env, [blockchain, sync_cooldown_time, 5]),
+              ct_rpc:call(Miner, application, set_env, [blockchain, sc_client_handler, router_sc_client_handler]),
+              ct_rpc:call(Miner, application, set_env, [blockchain, sc_packet_handler, router_sc_packet_handler]),
+              %% set miner configuration
+              ct_rpc:call(Miner, application, set_env, [miner, curve, Curve]),
+              ct_rpc:call(Miner, application, set_env, [miner, radio_device, {{127,0,0,1}, UDPPort, {127,0,0,1}, TCPPort}]),
+              ct_rpc:call(Miner, application, set_env, [miner, stabilization_period_start, 2]),
+
+              {ok, _StartedApps} = ct_rpc:call(Miner, application, ensure_all_started, [miner]),
+              ok
+      end,
+      MinerKeys
+     ).
+
+start_runner() ->
+    os:cmd(os:find_executable("epmd")++" -daemon"),
+    {ok, Hostname} = inet:gethostname(),
+    case net_kernel:start([list_to_atom("runner-miner" ++
+                                            integer_to_list(erlang:system_time(nanosecond)) ++
+                                            "@"++Hostname), shortnames]) of
+        {ok, _} -> ok;
+        {error, {already_started, _}} -> ok;
+        {error, {{already_started, _},_}} -> ok
+    end.
+
+set_miner_default_routers(Miners, DefaultRouters) ->
+    Res = miner_test:pmap(fun(M) ->
+                                  ct_rpc:call(M, application, set_env, [miner, default_routers, DefaultRouters])
+                          end,
+                          Miners),
+    lists:all(fun(R) -> R == ok end, Res).
+
+get_ledger_state_channel(Node, SCID, PubkeyBin) ->
+    RouterChain = ct_rpc:call(Node, blockchain_worker, blockchain, []),
+    RouterLedger = ct_rpc:call(Node, blockchain, ledger, [RouterChain]),
+    ct_rpc:call(Node, blockchain_ledger_v1, find_state_channel, [SCID, PubkeyBin, RouterLedger]).
+
+check_ledger_state_channel(LedgerSC, OwnerPubkeyBin, SCID) ->
+    CheckId = SCID == blockchain_ledger_state_channel_v1:id(LedgerSC),
+    CheckOwner = OwnerPubkeyBin == blockchain_ledger_state_channel_v1:owner(LedgerSC),
+    CheckId andalso CheckOwner.
+
+check_sc_num_packets(SCCloseTxn, ClientPubkeyBin, ExpectedNumPackets) ->
+    SC = blockchain_txn_state_channel_close_v1:state_channel(SCCloseTxn),
+    {ok, NumPackets} = blockchain_state_channel_v1:num_packets_for(ClientPubkeyBin, SC),
+    ExpectedNumPackets == NumPackets.
+
+check_sc_num_dcs(SCCloseTxn, ClientPubkeyBin, ExpectedNumDCs) ->
+    SC = blockchain_txn_state_channel_close_v1:state_channel(SCCloseTxn),
+    {ok, NumDCs} = blockchain_state_channel_v1:num_dcs_for(ClientPubkeyBin, SC),
+    ExpectedNumDCs == NumDCs.

@@ -8,8 +8,5 @@ compile:
 clean:
 	$(REBAR) clean
 
-test: compile
-	$(REBAR) as test do xref, eunit, ct && $(REBAR) dialyzer
-
 typecheck:
 	$(REBAR) dialyzer
