@@ -8,6 +8,7 @@
 -export([
          init_per_testcase/3,
          end_per_testcase/2,
+         cleanup_per_testcase/2,
          pmap/2, pmap/3,
          wait_until/1, wait_until/3,
          wait_until_disconnected/2,
@@ -51,6 +52,12 @@
          confirm_balance/3,
          confirm_balance_both_sides/5,
          wait_for_gte/3, wait_for_gte/5,
+         init_ports/2, init_keys/2,
+         check_config_result/1,
+         acc_listen_addrs/1,
+         connect_addrs/2,
+         check_gossip/2,
+         acc_pubkey_bins/1,
 
          submit_txn/2,
          wait_for_txn/2, wait_for_txn/3, wait_for_txn/4,
