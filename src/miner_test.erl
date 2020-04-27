@@ -558,6 +558,7 @@ init_per_testcase(Mod, TestCase, Config0) ->
 
     [
      {miners, Miners},
+     {miner_listen_addrs, MinerListenAddrs},
      {miner_keys, MinerKeys},
      {ports, UpdatedMinersAndPorts},
      {miner_pubkey_bins, MinerPubkeyBins},
