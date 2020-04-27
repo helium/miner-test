@@ -1,9 +1,4 @@
 miner_test
 =====
 
-An OTP library
-
-Build
------
-
-    $ rebar3 compile
+Helium miner testing utilities.
