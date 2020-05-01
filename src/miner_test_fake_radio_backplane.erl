@@ -7,7 +7,6 @@
 -export([transmit/3, get_next_packet/0]).
 
 -include("miner_test_macros.hrl").
--include("lora.hrl").
 
 -record(state, {
                 udp_sock,
@@ -50,7 +49,7 @@ handle_call(Msg, _From, State) ->
 handle_cast({get_next, Pid}, State) ->
     {noreply, State#state{mirror=Pid}};
 handle_cast({transmit, Payload, Frequency, TxLocation}, State = #state{udp_sock=UDPSock, udp_ports=Ports, poc_version=POCVersion}) ->
-    ct:pal("transmitting"),
+    lager:info("transmitting"),
     Token = crypto:strong_rand_bytes(2),
     lists:foreach(
       fun({Port, Location}) ->
@@ -67,7 +66,7 @@ handle_cast({transmit, Payload, Frequency, TxLocation}, State = #state{udp_sock=
                   true -> ok;
                   false ->
                       NewJSON = #{<<"rxpk">> => [#{<<"rssi">> => RSSI, <<"lsnr">> => 1.0, <<"tmst">> => erlang:system_time(seconds), <<"data">> => base64:encode(Payload), <<"freq">> => Frequency, <<"datr">> => <<"SF8BW125">>}]},
-                      ct:pal("Sending ~p", [NewJSON]),
+                      lager:info("Sending ~p", [NewJSON]),
                       gen_udp:send(UDPSock, {127, 0, 0, 1}, Port, <<?PROTOCOL_2:8/integer-unsigned, Token:2/binary, ?PUSH_DATA:8/integer-unsigned, 16#deadbeef:64/integer, (jsx:encode(NewJSON))/binary>>)
               end
       end,
@@ -93,7 +92,6 @@ handle_info({udp, UDPSock, IP, SrcPort, <<?PROTOCOL_2:8/integer-unsigned, Token:
         _ ->
             ok
     end,
-                                                %ct:pal("Source port ~p, Ports ~p", [SrcPort, Ports]),
     {SrcPort, OriginLocation} = lists:keyfind(SrcPort, 1, Ports),
     lists:foreach(
       fun({Port, Location}) ->
@@ -116,7 +114,7 @@ handle_info({udp, _UDPSock, _IP, _SrcPort, <<?PROTOCOL_2:8/integer-unsigned, _To
 handle_info({udp, _UDPSock, _IP, _SrcPort, <<?PROTOCOL_2:8/integer-unsigned, _Token:2/binary, ?PULL_ACK:8/integer-unsigned>>}, State) ->
     {noreply, State};
 handle_info(Msg, State) ->
-    ct:pal("unhandled info ~p", [Msg]),
+    lager:info("unhandled info ~p", [Msg]),
     {noreply, State}.
 
 %% ------------------------------------------------------------------
@@ -128,10 +126,10 @@ approx_rssi(Distance) ->
 do_send(ToSend, Distance, _OriginLocation, _Location, Token, Packet, UDPSock, Port) ->
     case Distance > 32 of
         true ->
-            ct:pal("NOT sending from ~p to ~p -> ~p km", [_OriginLocation, _Location, Distance]),
+            lager:info("NOT sending from ~p to ~p -> ~p km", [_OriginLocation, _Location, Distance]),
             ok;
         false ->
             NewJSON = #{<<"rxpk">> => [maps:merge(maps:without([<<"imme">>, <<"rfch">>, <<"powe">>], Packet), #{<<"rssi">> => ToSend, <<"lsnr">> => 1.0, <<"tmst">> => erlang:system_time(seconds)})]},
-            ct:pal("sending ~p from ~p to ~p -> ~p km RSSI ~p", [NewJSON, _OriginLocation, _Location, Distance, ToSend]),
+            lager:info("sending ~p from ~p to ~p -> ~p km RSSI ~p", [NewJSON, _OriginLocation, _Location, Distance, ToSend]),
             gen_udp:send(UDPSock, {127, 0, 0, 1}, Port, <<?PROTOCOL_2:8/integer-unsigned, Token:2/binary, ?PUSH_DATA:8/integer-unsigned, 16#deadbeef:64/integer, (jsx:encode(NewJSON))/binary>>)
     end.
