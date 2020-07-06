@@ -1023,6 +1023,7 @@ miner_config_result(LogDir, BaseDir, Port, SeedNodes, TotalMiners, Curve, MinerK
               ct:pal("MinerLogRoot: ~p", [LogRoot]),
               ct_rpc:call(Miner, application, set_env, [lager, log_root, LogRoot]),
               ct_rpc:call(Miner, application, set_env, [lager, metadata_whitelist, [poc_id]]),
+              ct_rpc:call(Miner, lager, set_loglevel, [{lager_file_backend, "log/console.log"}, debug]),
 
               %% set blockchain configuration
               Key = {PubKey, ECDH, SigFun},
@@ -1047,6 +1048,8 @@ miner_config_result(LogDir, BaseDir, Port, SeedNodes, TotalMiners, Curve, MinerK
               ct_rpc:call(Miner, application, set_env, [miner, curve, Curve]),
               ct_rpc:call(Miner, application, set_env, [miner, radio_device, {{127,0,0,1}, UDPPort, {127,0,0,1}, TCPPort}]),
               ct_rpc:call(Miner, application, set_env, [miner, stabilization_period_start, 2]),
+              ct_rpc:call(Miner, application, set_env, [miner, region_override, 'US915']),
+              ct_rpc:call(Miner, application, set_env, [miner, frequency_data,  #{'US915' => [903.9, 904.1, 904.3, 904.5, 904.7, 904.9, 905.1, 905.3]}]),
 
               {ok, _StartedApps} = ct_rpc:call(Miner, application, ensure_all_started, [miner]),
               ok
